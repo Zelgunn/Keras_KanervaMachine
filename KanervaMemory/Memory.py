@@ -5,9 +5,24 @@ from tensorflow.python.keras.initializers import constant, zeros, truncated_norm
 from tensorflow.python.framework.tensor_shape import TensorShape
 from tensorflow.python.keras import backend
 from tensorflow_probability.python.distributions import MultivariateNormalDiag
-from typing import Optional, Dict, Any, Union, Tuple
+import functools
+from typing import Optional, Dict, Any, Union, Tuple, Callable
 
-from MemoryState import MemoryState
+from KanervaMemory.MemoryState import MemoryState
+
+
+def define_scope(scope: str = None):
+    def decorator(function):
+        name_scope = scope or function.__name__
+
+        @functools.wraps(function)
+        def decorated(*args, **kwargs):
+            with tf.name_scope(name_scope):
+                return function(*args, **kwargs)
+
+        return decorated
+
+    return decorator
 
 
 class Memory(Layer):
@@ -38,7 +53,7 @@ class Memory(Layer):
 
         self.prior_memory_mean: Optional[tf.Tensor] = None
         self.prior_memory_covariance: Optional[tf.Tensor] = None
-        self.prior_w_distribution: Optional[MultivariateNormalDiag] = None
+        self.w_prior_distribution: Optional[MultivariateNormalDiag] = None
 
         self._code_size: Optional[tf.Tensor] = None
         self._memory_size: Optional[tf.Tensor] = None
@@ -62,22 +77,19 @@ class Memory(Layer):
         if self.batch_size is not None:
             self._batch_size = tf.constant(self.batch_size, name="batch_size")
 
-        self.prior_w_distribution = MultivariateNormalDiag(loc=tf.zeros(shape=[self._memory_size]),
-                                                           scale_identity_multiplier=self._w_prior_stddev)
-
         # region Address weights
-        self._w_prior_stddev = tf.constant(self.w_prior_stddev,
-                                           name="w_prior_stddev")
+        with tf.name_scope("w_prior"):
+            self._w_prior_stddev = tf.constant(self.w_prior_stddev,
+                                               name="w_prior_stddev")
+    
+            self.w_prior_distribution = MultivariateNormalDiag(loc=tf.zeros(shape=[self._memory_size]),
+                                                               scale_identity_multiplier=self._w_prior_stddev,
+                                                               name="w_prior_distribution")
 
         log_w_stddev = self.add_weight(initializer=constant(self.initial_w_stddev),
-                                       name="w_stddev",
+                                       name="log_w_stddev",
                                        shape=[])
-        self._w_stddev = tf.exp(log_w_stddev)
-
-        self._w_distribution = MultivariateNormalDiag(
-            loc=tf.zeros(shape=[self.memory_size]),
-            scale_identity_multiplier=self._w_prior_stddev
-        )
+        self._w_stddev = tf.exp(log_w_stddev, name="w_stddev")
         # endregion
 
         # region Observational noise
@@ -86,29 +98,33 @@ class Memory(Layer):
                                                      name="observational_noise_stddev")
         else:
             log_observational_noise_stddev = self.add_weight(initializer=zeros(),
-                                                             name="observational_noise_stddev",
+                                                             name="log_observational_noise_stddev",
                                                              shape=[])
-            observational_noise_stddev = tf.exp(log_observational_noise_stddev)
+            observational_noise_stddev = tf.exp(log_observational_noise_stddev,
+                                                name="observational_noise_stddev")
         self._observational_noise_stddev = observational_noise_stddev
         # endregion
 
         self.built = True
 
     def build_prior_state(self):
-        # region Prior memory mean
-        mean_initializer = truncated_normal(mean=0.0, stddev=1.0)
-        self.prior_memory_mean = self.add_weight(name="prior_memory_mean",
-                                                 shape=[self.memory_size, self.code_size],
-                                                 initializer=mean_initializer)
-        # endregion
+        with tf.name_scope("prior_state"):
+            # region Prior memory mean
+            mean_initializer = truncated_normal(mean=0.0, stddev=1.0)
+            self.prior_memory_mean = self.add_weight(name="prior_memory_mean",
+                                                     shape=[self.memory_size, self.code_size],
+                                                     initializer=mean_initializer)
+            # endregion
 
-        # region Prior memory covariance
-        log_variance_scale = self.add_weight(name="prior_memory_log_variance_scale",
-                                             shape=[],
-                                             initializer=zeros)
-        variance = log_variance_scale * tf.ones([self.memory_size]) + backend.epsilon()
-        self.prior_memory_covariance = tf.matrix_diag(variance, name="prior_memory_covariance")
-        # endregion
+            # region Prior memory covariance
+            log_variance_scale = self.add_weight(name="prior_memory_log_variance_scale",
+                                                 shape=[],
+                                                 initializer=zeros)
+            variance = log_variance_scale * tf.ones([self.memory_size]) + backend.epsilon()
+            self.prior_memory_covariance = tf.matrix_diag(variance, name="prior_memory_covariance")
+            # endregion
+
+        self._non_trainable_weights += [self.prior_memory_covariance, self.prior_memory_mean]
 
     def compute_output_shape(self, input_shape):
         print("Memory.compute_output_shape - input_shape:type", type(input_shape))
@@ -127,15 +143,20 @@ class Memory(Layer):
         inputs = tf.transpose(inputs, perm=[1, 0, 2])
         posterior_memory, w_divergence_episode, memory_divergence_episode = self.update_state(prior_state, inputs)
 
-        z_mean, divergence_w = self.read_memory(posterior_memory, inputs)
+        z_mean, w_divergence = self.read_memory(posterior_memory, inputs)
 
         z_distribution = self.get_z_distribution(z_mean)
         z_sample = z_distribution.sample(name="sample_z")
 
-        outputs = tf.transpose(z_sample, perm=[1, 0, 2])
+        with tf.name_scope("total_kl_divergence"):
+            total_divergence = tf.reduce_mean(w_divergence_episode + w_divergence)
+        self.add_loss(total_divergence)
 
-        return outputs
+        z_sample = tf.transpose(z_sample, perm=[1, 0, 2])
 
+        return z_sample
+
+    @define_scope()
     def get_prior_state(self, batch_size: Union[int, tf.Tensor]) -> MemoryState:
         """Return the prior distribution of memory as a MemoryState."""
 
@@ -154,6 +175,7 @@ class Memory(Layer):
                            row_covariance=covariance)
 
     # region Update memory state
+    @define_scope()
     def update_state(self,
                      memory_state: MemoryState,
                      z: tf.Tensor
@@ -162,7 +184,7 @@ class Memory(Layer):
             raise NotImplementedError
 
         z_shape = tf.shape(z)
-        episode_length = z_shape[1]
+        episode_length = z_shape[0]
 
         # region Loop Vars (initial values)
         initial_memory = memory_state
@@ -284,6 +306,7 @@ class Memory(Layer):
     # endregion
 
     # region Read from memory with z
+    @define_scope()
     def read_memory(self,
                     memory_state: MemoryState,
                     z: tf.Tensor,
@@ -301,8 +324,8 @@ class Memory(Layer):
         w_mean = self.solve_w_mean(memory_sample, z)
         w_sample = self.sample_w(w_mean)
         z_mean = self.z_mean_from_memory(w_sample, memory_sample)
-        divergence_w = self.get_w_divergence(w_mean)
-        return z_mean, divergence_w
+        w_divergence = self.get_w_divergence(w_mean)
+        return z_mean, w_divergence
 
     def read_memory_with_addressing_matrix(self,
                                            memory_state: MemoryState,
@@ -315,14 +338,14 @@ class Memory(Layer):
     # region Distributions
     def get_w_distribution(self,
                            w_mean
-                           ) -> tfp.distributions.MultivariateNormalDiag:
+                           ) -> MultivariateNormalDiag:
         return MultivariateNormalDiag(loc=w_mean,
                                       scale_identity_multiplier=self._w_stddev,
                                       name="w_distribution")
 
     def get_z_distribution(self,
                            z_mean: tf.Tensor
-                           ) -> tfp.distributions.MultivariateNormalDiag:
+                           ) -> MultivariateNormalDiag:
         return MultivariateNormalDiag(loc=z_mean,
                                       scale_identity_multiplier=self._observational_noise_stddev,
                                       name="z_distribution")
@@ -330,12 +353,14 @@ class Memory(Layer):
     # endregion
 
     # region Sampling
+    @define_scope()
     def sample_memory(self, memory_state: MemoryState) -> tf.Tensor:
         if self.use_memory_mean_as_samples:
             return memory_state.mean
         else:
             return memory_state.sample(self._code_size)
 
+    @define_scope()
     def sample_w(self, w_mean: tf.Tensor) -> tf.Tensor:
         if self.use_w_mean_as_samples:
             return w_mean
@@ -344,6 +369,7 @@ class Memory(Layer):
 
     # endregion
 
+    @define_scope()
     def solve_w_mean(self,
                      memory_sample: tf.Tensor,
                      z: tf.Tensor) -> tf.Tensor:
@@ -360,14 +386,17 @@ class Memory(Layer):
         return w_mean
 
     @staticmethod
+    @define_scope()
     def z_mean_from_memory(w_sample: tf.Tensor, memory_sample: tf.Tensor, name="z_mean_from_memory"):
         return tf.einsum("ebm,bmc->ebc", w_sample, memory_sample, name=name)
 
     # region Kullback Leibler divergence
+    @define_scope()
     def get_w_divergence(self, w_mean: tf.Tensor) -> tf.Tensor:
         with tf.name_scope("w_kl_divergence"):
-            return self.get_w_distribution(w_mean).kl_divergence(self.prior_w_distribution)
+            return self.get_w_distribution(w_mean).kl_divergence(self.w_prior_distribution)
 
+    @define_scope()
     def get_update_divergence(self,
                               memory_state: MemoryState,
                               w_sample: tf.Tensor,
